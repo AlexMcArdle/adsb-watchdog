@@ -1,0 +1,7 @@
+[Unit]
+Description=ADS-B stack watchdog
+After=readsb.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/adsb-watchdog

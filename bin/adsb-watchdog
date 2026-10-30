@@ -1,0 +1,233 @@
+#!/bin/bash
+# ADS-B stack watchdog.
+#
+# Escalation ladder when the RTL-SDR misbehaves:
+#   1. device present, readsb output stale  -> usbreset, restart readsb
+#   2. device gone                          -> port disable/enable (software replug)
+#   3. port cycle didn't help               -> unbind/bind the xHCI controller
+#   4. still gone                           -> warn; genuinely needs hands
+#
+# Port location is auto-discovered while the device is present and persisted,
+# because once the dongle drops off the bus there is no way to look it up.
+set -uo pipefail
+
+LOG_TAG="adsb-watchdog"
+RTL_VID_PID="0bda:2838"
+AIRCRAFT_JSON="/run/readsb/aircraft.json"
+STALE_SECS=90
+PING_WINDOW="3 minutes ago"
+
+STATE_DIR="/run/adsb-watchdog"          # tmpfs: cooldown stamps
+PERSIST_DIR="/var/lib/adsb-watchdog"    # survives reboot: last known port
+
+PORT_CYCLE_COOLDOWN=180
+HCD_CYCLE_COOLDOWN=900
+RESET_COOLDOWN=120
+FT_COOLDOWN=600
+
+log()  { logger -t "$LOG_TAG" -p daemon.notice -- "$*"; }
+warn() { logger -t "$LOG_TAG" -p daemon.warning -- "WARN: $*"; }
+
+mkdir -p "$STATE_DIR" "$PERSIST_DIR"
+
+# --- cooldown helper -------------------------------------------------------
+# cooldown_ok <name> <seconds> -- true (and stamps) if the window has elapsed.
+cooldown_ok() {
+    local window="$2" f="$STATE_DIR/last_$1" now last=0
+    now=$(date +%s)
+    [ -f "$f" ] && last=$(cat "$f" 2>/dev/null || echo 0)
+    if (( now - last >= window )); then
+        echo "$now" > "$f"
+        return 0
+    fi
+    COOLDOWN_REMAINING=$(( window - (now - last) ))
+    return 1
+}
+
+device_present() { lsusb -d "$RTL_VID_PID" &>/dev/null; }
+
+# --- port discovery --------------------------------------------------------
+# Resolve the sysfs port directory for the dongle and remember it. Only works
+# while the device is on the bus; the cached value covers the absent case.
+remember_port() {
+    local dev bus devpath portdir
+    for dev in /sys/bus/usb/devices/*/; do
+        [ -f "$dev/idVendor" ] || continue
+        [ "$(cat "$dev/idVendor" 2>/dev/null)" = "${RTL_VID_PID%%:*}" ] || continue
+        [ "$(cat "$dev/idProduct" 2>/dev/null)" = "${RTL_VID_PID##*:}" ] || continue
+        bus=$(cat "$dev/busnum" 2>/dev/null) || continue
+        devpath=$(cat "$dev/devpath" 2>/dev/null) || continue
+        # Root-hub ports are named usb<bus>-port<n>. Devices behind an external
+        # hub have a dotted devpath (e.g. 2.1) and are not handled here.
+        if [[ "$devpath" == *.* ]]; then
+            portdir=""
+        else
+            portdir="/sys/bus/usb/devices/${bus}-0:1.0/usb${bus}-port${devpath}"
+        fi
+        if [ -n "$portdir" ] && [ -w "$portdir/disable" ]; then
+            echo "$portdir" > "$PERSIST_DIR/sdr_port"
+            # xHCI controller backing this bus, for the tier-3 rebind.
+            local hcd
+            hcd=$(basename "$(dirname "$(readlink -f "/sys/bus/usb/devices/usb${bus}")")" 2>/dev/null)
+            [ -n "$hcd" ] && echo "$hcd" > "$PERSIST_DIR/sdr_hcd"
+            return 0
+        fi
+    done
+    return 1
+}
+
+cached_port() { cat "$PERSIST_DIR/sdr_port" 2>/dev/null; }
+cached_hcd()  { cat "$PERSIST_DIR/sdr_hcd" 2>/dev/null; }
+
+# --- tier 2: port disable/enable (software replug) -------------------------
+cycle_port() {
+    local portdir="$1"
+    if [ ! -w "$portdir/disable" ]; then
+        warn "port $portdir not writable — cannot cycle"
+        return 1
+    fi
+    warn "cycling USB port $(basename "$portdir") (software replug)"
+    echo 1 > "$portdir/disable" 2>/dev/null
+    sleep 3
+    echo 0 > "$portdir/disable" 2>/dev/null
+    sleep 5
+    device_present
+}
+
+# --- tier 3: rebind the xHCI controller ------------------------------------
+cycle_hcd() {
+    local hcd="$1" drv=/sys/bus/platform/drivers/xhci-hcd
+    if [ -z "$hcd" ] || [ ! -e "$drv/$hcd" ]; then
+        warn "xHCI controller '$hcd' not found — skipping rebind"
+        return 1
+    fi
+    warn "rebinding xHCI controller $hcd (resets every device on that controller)"
+    echo "$hcd" > "$drv/unbind" 2>/dev/null
+    sleep 4
+    echo "$hcd" > "$drv/bind" 2>/dev/null
+    sleep 8
+    device_present
+}
+
+# --- restart readsb, clearing any start-limit lockout ----------------------
+restart_readsb() {
+    if [ "$(systemctl show readsb -p ActiveState --value)" = "failed" ] \
+       || [ "$(systemctl show readsb -p Result --value)" = "start-limit-hit" ]; then
+        log "clearing readsb failed state before restart"
+        systemctl reset-failed readsb
+    fi
+    systemctl restart readsb
+}
+
+# ===========================================================================
+# 1. USB presence
+# ===========================================================================
+if device_present; then
+    remember_port || true
+
+    # Over-current events are the direct signature of a power problem.
+    PORTDIR=$(cached_port)
+    if [ -n "$PORTDIR" ] && [ -r "$PORTDIR/over_current_count" ]; then
+        OC=$(cat "$PORTDIR/over_current_count" 2>/dev/null || echo 0)
+        [ "${OC:-0}" -gt 0 ] && warn "port reports $OC over-current event(s) — check power supply / powered hub"
+    fi
+else
+    warn "RTL-SDR ($RTL_VID_PID) not found on USB bus"
+
+    PORTDIR=$(cached_port)
+    RECOVERED=false
+
+    # Tier 2: software replug.
+    if [ -n "$PORTDIR" ]; then
+        if cooldown_ok port_cycle "$PORT_CYCLE_COOLDOWN"; then
+            if cycle_port "$PORTDIR"; then
+                log "port cycle recovered the device — restarting readsb"
+                restart_readsb
+                RECOVERED=true
+            else
+                warn "port cycle did not bring the device back"
+            fi
+        else
+            log "port cycle within cooldown (${COOLDOWN_REMAINING}s remaining) — skipping"
+        fi
+    else
+        warn "no cached port location (device has not been seen since install) — cannot cycle"
+    fi
+
+    # Tier 3: controller rebind.
+    if ! $RECOVERED && ! device_present; then
+        if cooldown_ok hcd_cycle "$HCD_CYCLE_COOLDOWN"; then
+            if cycle_hcd "$(cached_hcd)"; then
+                log "xHCI rebind recovered the device — restarting readsb"
+                restart_readsb
+                RECOVERED=true
+            else
+                warn "xHCI rebind did not bring the device back — manual replug required"
+            fi
+        else
+            log "xHCI rebind within cooldown (${COOLDOWN_REMAINING}s remaining) — skipping"
+        fi
+    fi
+
+    # Nothing further is useful this tick; services cannot run without a radio.
+    $RECOVERED || exit 0
+fi
+
+# ===========================================================================
+# 2. readsb health
+# ===========================================================================
+READSB_OK=true
+
+if ! systemctl is-active --quiet readsb; then
+    warn "readsb inactive, restarting"
+    restart_readsb
+    READSB_OK=false
+elif [ -f "$AIRCRAFT_JSON" ]; then
+    AGE=$(( $(date +%s) - $(stat -c %Y "$AIRCRAFT_JSON") ))
+    if [ "$AGE" -gt "$STALE_SECS" ]; then
+        # Device enumerated but producing nothing: classic wedged-dongle case.
+        warn "readsb output stale (${AGE}s) with device present — resetting dongle"
+        if cooldown_ok usbreset "$RESET_COOLDOWN"; then
+            usbreset "$RTL_VID_PID" &>/dev/null \
+                && log "usbreset issued to $RTL_VID_PID" \
+                || warn "usbreset failed"
+        fi
+        restart_readsb
+        READSB_OK=false
+    fi
+fi
+
+# ===========================================================================
+# 3. fr24feed
+# ===========================================================================
+# fr24feed consumes readsb's Beast output; its ping check is only meaningful
+# when readsb itself was healthy this tick.
+if ! systemctl is-active --quiet fr24feed; then
+    warn "fr24feed inactive, restarting"
+    systemctl reset-failed fr24feed 2>/dev/null
+    systemctl restart fr24feed
+elif "$READSB_OK"; then
+    PINGS=$(journalctl -u fr24feed --since "$PING_WINDOW" -q 2>/dev/null \
+        | grep -c "\[feed\]\[n\]ping" || true)
+    if [ "$PINGS" -eq 0 ]; then
+        warn "fr24feed no pings in 3min, restarting"
+        systemctl restart fr24feed
+    fi
+fi
+
+# ===========================================================================
+# 4. flight-tracker (LED panel, Bluetooth)
+# ===========================================================================
+# The panel is frequently unreachable (powered off / out of range). Restarting
+# on every tick just churns Bluetooth, so back off hard and let it stay down.
+if ! systemctl is-active --quiet flight-tracker; then
+    if cooldown_ok flight_tracker "$FT_COOLDOWN"; then
+        warn "flight-tracker inactive, restarting (next attempt no sooner than ${FT_COOLDOWN}s)"
+        systemctl reset-failed flight-tracker 2>/dev/null
+        systemctl restart flight-tracker
+    else
+        log "flight-tracker down but within backoff (${COOLDOWN_REMAINING}s remaining) — leaving it"
+    fi
+fi
+
+exit 0

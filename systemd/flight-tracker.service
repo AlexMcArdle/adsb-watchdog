@@ -1,0 +1,18 @@
+[Unit]
+Description=Flight Tracker LED Display
+After=network-online.target bluetooth.target
+Wants=network-online.target bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/led_panel/flight_tracker
+ExecStartPre=+/bin/systemctl restart bluetooth
+ExecStart=/home/pi/led_panel/flight_tracker/run_display.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
